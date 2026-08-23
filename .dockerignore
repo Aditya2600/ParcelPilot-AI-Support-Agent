@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.gitignore
+.DS_Store
+evaluation_results.json
+evaluation_stability_results.json
+tests/
+README.md
+.env
+.env.*
+!.env.example

@@ -1,0 +1,72 @@
+services:
+  db:
+    # ParadeDB bundles pg_search (BM25) and pgvector (HNSW) on one Postgres, so
+    # lexical and dense retrieval run against the same rows under the same
+    # WHERE clause. Pinned tag, never `latest`, so migrations and index syntax
+    # stay reproducible.
+    image: paradedb/paradedb:0.24.1
+    environment:
+      # Local development credentials only.
+      POSTGRES_USER: ${POSTGRES_USER:-parcelpilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-parcelpilot_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-parcelpilot}
+    ports:
+      # Host 5434: 5432 is the default for any other local Postgres and 5433 is
+      # taken by the Inbox Copilot stack this retriever was modelled on.
+      - "5434:5432"
+    volumes:
+      # Postgres 18+ base images expect a single mount at /var/lib/postgresql,
+      # not .../data -- see docker-library/postgres#1259.
+      - parcelpilot_pg:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-parcelpilot} -d ${POSTGRES_DB:-parcelpilot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      # Service-to-service DNS name ("db"), not the host-mapped 5434 port above.
+      PARCELPILOT_DATABASE_URL: postgresql://${POSTGRES_USER:-parcelpilot}:${POSTGRES_PASSWORD:-parcelpilot_local_dev}@db:5432/${POSTGRES_DB:-parcelpilot}
+      # No fallback defaults for the endpoint/key: an internal URL or key has no
+      # business being a default committed to this file. Bare `KEY:` (no `${...}`
+      # interpolation, no `:-` default) is omitted from the container entirely
+      # when unset on the host/.env, rather than being set to "" -- `${VAR}` with
+      # no default would instead set an empty string and defeat app/llm.py's own
+      # os.getenv(..., default) fallback (unchanged, frozen backend behaviour).
+      MEDHA_BASE_URL:
+      MEDHA_API_KEY:
+      MEDHA_MODEL: ${MEDHA_MODEL:-Medha}
+      PARCELPILOT_MODEL_CACHE: /home/appuser/.cache/parcelpilot/models
+      # Null (no `:-` default): omitted from the container entirely unless set on
+      # the host/.env, so the app's own os.getenv(..., code_default) fallback
+      # applies. A `${VAR:-}` default would instead set an empty string, which
+      # *is* "set" to os.getenv() and would override the code default with "".
+      PARCELPILOT_EMBEDDING_MODEL:
+      PARCELPILOT_EMBEDDING_REVISION:
+      PARCELPILOT_RERANKER_MODEL:
+    volumes:
+      # Embedding model weights (~550MB) persist across restarts/rebuilds instead
+      # of re-downloading; content-hash ingest already makes restarts a no-op, this
+      # just makes the first request after a restart fast too.
+      - parcelpilot_model_cache:/home/appuser/.cache/parcelpilot/models
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  parcelpilot_pg:
+  parcelpilot_model_cache:
