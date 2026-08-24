@@ -86,6 +86,7 @@ export function ContextPanel({
         {activeTab === "evidence" && (
           <EvidenceTab
             sources={sources}
+            toolTrace={toolTrace}
             selectedSource={selectedSource}
             onSelectSource={onSelectSource}
           />

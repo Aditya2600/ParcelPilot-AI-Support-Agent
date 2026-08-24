@@ -373,13 +373,17 @@ class SupportAgent:
                 seen_chunk_ids.add(sc.source_id)
                 valid_source_chunks.append(sc)
 
-        # If model did not emit explicit citations and is not abstaining, include retrieved authoritative evidence
+        # If the model's claimed citations didn't resolve to any retrieved chunk
+        # (whether because it cited nothing, or cited something that didn't match --
+        # e.g. a descriptive phrase instead of a source_id) and it is not abstaining,
+        # fall back to the retrieved authoritative evidence rather than discarding a
+        # substantively grounded answer over a citation-formatting mismatch.
         is_abstaining = any(
             phrase in answer.lower()
             for phrase in ["do not have", "no information", "not found", "no policy", "unsupported", "cannot find", "escalat"]
         )
 
-        if not claimed_ids and not is_abstaining:
+        if not valid_source_chunks and not is_abstaining:
             for h in authoritative_evidence:
                 if not is_eligible_auth_hit(h):
                     continue

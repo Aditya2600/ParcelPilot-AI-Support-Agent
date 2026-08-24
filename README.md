@@ -5,8 +5,17 @@ support questions, grounded entirely in a supplied source pack — policies, SOP
 customer agreements, a product guide, and historical tickets. Answers only ever come from
 that source pack, never from the model's own memory of how "a" logistics company works.
 
+## Demo Videos
+
+| # | Title | Link |
+|---|---|---|
+| 1 | Architecture | https://www.loom.com/share/5027e795312145d887b80b1968fd2941 |
+| 2 | ParcelPilot — Contract Override & Source Authority | https://www.loom.com/share/6c8ef492a6914eac928c21332d0acd83 |
+| 3 | ParcelPilot — Multi-Step AI Support & Human-in-the-Loop Actions | https://www.loom.com/share/e287086abd014e1d8b9b1f31bb8ac7f1 |
+
 ## Contents
 
+- [Demo Videos](#demo-videos)
 - [Architecture](#architecture)
 - [Quickstart](#quickstart)
 - [Running the full stack in Docker](#running-the-full-stack-in-docker)
