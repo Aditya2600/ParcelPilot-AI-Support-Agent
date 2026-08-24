@@ -12,6 +12,7 @@ that source pack, never from the model's own memory of how "a" logistics company
 | 1 | Architecture | https://www.loom.com/share/5027e795312145d887b80b1968fd2941 |
 | 2 | ParcelPilot — Contract Override & Source Authority | https://www.loom.com/share/6c8ef492a6914eac928c21332d0acd83 |
 | 3 | ParcelPilot — Multi-Step AI Support & Human-in-the-Loop Actions | https://www.loom.com/share/e287086abd014e1d8b9b1f31bb8ac7f1 |
+| 4 | ParcelPilot — Tenant Isolation & Cross-Account Access Control | https://www.loom.com/share/83a52c6bf3fc4e309d3d4c6d055c86c0 |
 
 ## Contents
 
