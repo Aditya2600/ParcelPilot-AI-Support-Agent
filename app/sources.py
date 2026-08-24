@@ -38,6 +38,8 @@ class SourceChunk:
     lifecycle_state: str = "active"
     account_id: str | None = None
     document_version_id: str = ""
+    effective_from: date | None = None
+    effective_to: date | None = None
 
 
 def status_label(lifecycle_state: str) -> str:
@@ -98,6 +100,8 @@ class ParcelPilotData:
                 lifecycle_state=row["lifecycle_state"],
                 account_id=row["account_id"],
                 document_version_id=row["document_version_id"],
+                effective_from=row["effective_from"],
+                effective_to=row["effective_to"],
             )
             for row in active_chunks(self.retriever.conn)
         ]
@@ -136,6 +140,7 @@ class ParcelPilotData:
                 section=hit.section, document_type=hit.document_type,
                 lifecycle_state=hit.lifecycle_state, account_id=hit.account_id,
                 document_version_id=hit.document_version_id,
+                effective_from=hit.effective_from, effective_to=hit.effective_to,
             )
             for hit in hits
         ]
@@ -156,5 +161,7 @@ class ParcelPilotData:
                     "section": c.section,
                     "document_type": c.document_type,
                     "account_id": c.account_id,
+                    "effective_from": str(c.effective_from) if c.effective_from else None,
+                    "effective_to": str(c.effective_to) if c.effective_to else None,
                 })
         return result

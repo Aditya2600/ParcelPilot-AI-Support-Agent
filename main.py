@@ -1,18 +1,19 @@
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from app.agent import SupportAgent
 from app.llm import LLMUnavailable
-from app.models import ChatRequest, ChatResponse, ConfirmRequest
+from app.models import ChatRequest, ChatResponse, ConfirmRequest, Principal
 from app.rag import RetrievalUnavailable
 from app.sources import ParcelPilotData
-from app.tools import Toolbox
+from app.tools import SLA_ACCOUNT_OVERRIDES, Toolbox
 
 ROOT = Path(__file__).parent
 data = ParcelPilotData(ROOT / "data")
@@ -34,7 +35,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ParcelPilot Support Agent", version="1.0.0", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
+
+# The Next.js frontend is a separate origin, so the browser preflights every
+# POST it makes. Explicit allow-list, never "*": the API answers with account
+# data, so an arbitrary origin must not be able to read a response.
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
 
 
 @app.exception_handler(LLMUnavailable)
@@ -82,11 +97,6 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/")
-def index():
-    return FileResponse(ROOT / "static" / "index.html")
-
-
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
     return agent.answer(request.principal, request.message)
@@ -99,8 +109,51 @@ def confirm(request: ConfirmRequest):
 
 @app.get("/api/proactive")
 def proactive(role: str = "support_agent", user_id: str = "ops-1"):
-    from app.models import Principal
     return {"snapshot": data.snapshot, "issues": agent.triage.run(Principal(user_id=user_id, role=role))}
+
+
+@app.get("/api/accounts")
+def accounts(role: str = "support_agent", user_id: str = "support-1", account_id: str | None = None):
+    """Read-only account context for the UI's account panel.
+
+    Scope is the same rule the data tools enforce: a customer sees exactly their
+    own account, internal staff see all of them. Nothing here computes a business
+    answer -- SLA targets come from `Toolbox.sla_lookup` so the agreement-override
+    precedence stays in one place rather than being restated for the UI.
+    """
+    principal = Principal(user_id=user_id, role=role, account_id=account_id)
+    visible = [
+        str(row["account_id"])
+        for _, row in data.accounts.iterrows()
+        if principal.role != "customer" or str(row["account_id"]) == principal.account_id
+    ]
+
+    result = []
+    for acct_id in visible:
+        record = tools.account_lookup(principal, acct_id)["record"]
+        raw_account = data.account(acct_id)
+        orders = data.orders[data.orders.account_id == acct_id]
+        tickets = data.tickets[data.tickets.account_id == acct_id]
+        result.append({
+            **record,
+            "csm": str(raw_account.get("csm", "")),
+            "notes": str(raw_account.get("notes", "")),
+            "sla_targets": {
+                severity: {
+                    **tools.sla_lookup(principal, acct_id, severity),
+                    "is_override": acct_id in SLA_ACCOUNT_OVERRIDES,
+                }
+                for severity in ("P1", "P2", "P3")
+            },
+            "orders": [Toolbox._record(row) for _, row in orders.iterrows()],
+            # Same reason `ticket_lookup` drops it: the dataset warns the recorded
+            # historical resolution was sometimes wrong, so it is never surfaced.
+            "tickets": [
+                {k: v for k, v in Toolbox._record(row).items() if k != "historical_resolution"}
+                for _, row in tickets.iterrows()
+            ],
+        })
+    return {"snapshot": data.snapshot, "accounts": result}
 
 
 @app.get("/api/demo-principals")

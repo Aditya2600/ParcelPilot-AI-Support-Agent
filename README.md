@@ -1,10 +1,131 @@
 # ParcelPilot Support Agent
 
-A runnable assessment submission that supports both customer-facing and internal support contexts. It deliberately uses the supplied source pack as the only business-information base.
+A support agent for a logistics platform that answers both customer-facing and internal
+support questions, grounded entirely in a supplied source pack — policies, SOPs, signed
+customer agreements, a product guide, and historical tickets. Answers only ever come from
+that source pack, never from the model's own memory of how "a" logistics company works.
 
-## Run
+## Contents
 
-Requires Python 3.10+ and Docker (for the retrieval store).
+- [Architecture](#architecture)
+- [Quickstart](#quickstart)
+- [Running the full stack in Docker](#running-the-full-stack-in-docker)
+- [What it demonstrates](#what-it-demonstrates)
+- [Retrieval design](#retrieval-design)
+- [Trust model](#trust-model)
+- [Deliberate limits](#deliberate-limits)
+- [Tests](#tests)
+- [Roadmap](#roadmap)
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    USER / SUPPORT AGENT                      │
+│         (customer session, or internal support/ops role)     │
+└───────────────────────────────┬────────────────────────────────┘
+                                 │
+                                 ▼
+┌──────────────────────────────────────────────────────────────┐
+│  FRONTEND — Next.js, React, TypeScript, Tailwind, Radix UI    │
+│                                                                │
+│  Chat · account context · evidence panel · tool trace ·       │
+│  escalation confirmation                                      │
+└───────────────────────────────┬────────────────────────────────┘
+                                 │ HTTPS / JSON  (CORS)
+                                 ▼
+┌──────────────────────────────────────────────────────────────┐
+│  API — FastAPI                                                │
+│                                                                │
+│  Principal resolution · request validation · chat endpoint ·  │
+│  confirmation endpoint · health check                         │
+└───────────────────────────────┬────────────────────────────────┘
+                                 │
+                                 ▼
+┌──────────────────────────────────────────────────────────────┐
+│  AGENT LOOP — LangGraph state machine                         │
+│                                                                │
+│    planner → execute tool → observation → planner → ...       │
+│                     │                                          │
+│                     ├─ another tool call                       │
+│                     └─ final answer                            │
+│                                                                │
+│  State-changing flow:                                          │
+│    planner → tool → confirmation gate → final answer only      │
+└───────────────────────────────┬────────────────────────────────┘
+                                 │  structured tool call
+                                 ▼
+┌──────────────────────────────────────────────────────────────┐
+│  TOOLBOX — the enforcement boundary                            │
+│                                                                │
+│  The LLM chooses what it wants to do.                         │
+│  The Toolbox decides what it is actually allowed to do.       │
+│                                                                │
+│  document_search · order_lookup · ticket_lookup ·              │
+│  account_lookup · sla_lookup · calculate_credit ·               │
+│  prepare_escalation · confirm_action · triage (proactive queue) │
+└───────────┬─────────────────────────────────┬────────────────┘
+            │                                 │
+            ▼                                 ▼
+┌───────────────────────┐        ┌─────────────────────────────┐
+│  STRUCTURED DATA       │        │  RAG LAYER                  │
+│                        │        │                             │
+│  orders · tickets ·    │        │  ingest · chunking ·        │
+│  accounts · pending    │        │  BM25 · dense vectors ·     │
+│  actions               │        │  RRF fusion · authority      │
+│                        │        │  resolution                 │
+└───────────┬────────────┘        └──────────────┬──────────────┘
+            │                                    │
+            └──────────────────┬─────────────────┘
+                                ▼
+┌──────────────────────────────────────────────────────────────┐
+│  ParadeDB — Postgres + pg_search (BM25) + pgvector             │
+│                                                                │
+│  documents & chunks · embeddings · accounts · orders ·         │
+│  tickets · pending actions                                    │
+└───────────────────────────────┬────────────────────────────────┘
+                                 │
+                                 ▼
+┌──────────────────────────────────────────────────────────────┐
+│  LLM — external, OpenAI-compatible endpoint                   │
+│                                                                │
+│  Chooses tools · interprets evidence · writes the final answer │
+│                                                                │
+│  No database credentials. No mutation privileges. Every        │
+│  permission and business-rule decision is enforced in the      │
+│  Toolbox, not by the model.                                    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Components
+
+| Layer | What it is | What it owns |
+|---|---|---|
+| **Frontend** (`frontend/`) | Next.js 16 / React 19, TypeScript, Tailwind, Radix UI | Chat UI, account/evidence/tool-trace panels. Talks to the API only via `NEXT_PUBLIC_API_BASE_URL`, baked into the client bundle at build time. |
+| **API** (`main.py`) | FastAPI | Routes, CORS allow-list, health check. Delegates everything else to the agent. |
+| **Agent loop** (`app/agent.py`, `app/graph.py`) | LangGraph state machine | Sequences plan → tool → observation cycles; forces final-answer-only mode after an action is staged. |
+| **Toolbox** (`app/tools.py`) | Plain Python, no LLM involved | Every permission check, every business rule (credit calc, SLA lookup), the confirmation gate. This is the trust boundary — the LLM proposes, the Toolbox disposes. |
+| **RAG layer** (`app/rag/`) | Python + SQL | Ingestion, chunking, hybrid retrieval, authority resolution. |
+| **Store** | ParadeDB (Postgres + `pg_search` + `pgvector`) | One database, one set of rows, so lexical and dense search can't drift apart. Also holds the structured order/ticket/account tables. |
+| **LLM** | External, OpenAI-compatible (served via vLLM) | Plans, reasons over evidence, writes prose. Never touches the database and never grants itself permissions — every access decision it "requests" is re-checked in the Toolbox. |
+
+### A chat turn, end to end
+
+1. Frontend sends `POST /api/chat` with the message and the current principal (who is asking).
+2. The agent loop asks the LLM to plan: answer directly, or call a tool.
+3. If a tool is called, the **Toolbox** checks the caller's permissions and runs it — a
+   structured lookup, a hybrid document search, or a calculation. The result goes back to the
+   LLM as an observation.
+4. This repeats until the LLM either answers, or stages a state-changing action (an
+   escalation). Staging routes into a **confirmation gate**: the LLM is now structurally
+   limited to producing a final answer and cannot call another tool.
+5. The response — answer, cited evidence, and the full tool trace — goes back to the frontend
+   for display.
+
+## Quickstart
+
+Requires Python 3.10+, Node 22+ (for the frontend, if run outside Docker), and Docker (for
+the retrieval store).
 
 ```bash
 cd parcelpilot-agent
@@ -15,39 +136,41 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
-Open `http://127.0.0.1:8000`. The UI has mock principals for two customers and two internal roles.
+In a second terminal, run the frontend against that API:
 
-First start applies `app/rag/migrations/`, downloads the embedding model (~550 MB, once) and
-ingests the source pack. Later starts re-check each document's content hash and do nothing when
-nothing changed. Configure with `PARCELPILOT_DATABASE_URL` and `PARCELPILOT_EMBEDDING_MODEL`.
+```bash
+cd frontend
+cp .env.example .env.local       # NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+npm install
+npm run dev
+```
 
-## Run the full stack in Docker
+Open `http://localhost:3000`. The UI ships with mock principals for two customers and two
+internal roles.
 
-One command starts the API (which also serves the static frontend at `/`) and PostgreSQL/ParadeDB
-together. There is no separate frontend service or Dockerfile -- the UI is static files the FastAPI
-app already mounts and serves itself.
+First start applies the database migrations, downloads the embedding model (~550 MB, once),
+and ingests the source pack. Later starts re-check each document's content hash and do
+nothing when nothing changed.
+
+## Running the full stack in Docker
+
+One command starts the frontend, the API, and Postgres/ParadeDB together.
 
 ```bash
 cd parcelpilot-agent
-cp .env.example .env    # adjust MEDHA_API_KEY etc. if needed
+cp .env.example .env    # set the LLM endpoint/key, adjust ports if needed
 docker compose up --build
 ```
 
-Then open `http://localhost:8000`.
+Open `http://localhost:3000` — the frontend talks to the API published at
+`http://localhost:8000`.
 
-- **Health checks**: `db` uses `pg_isready`; `api` polls `GET /api/health` (checks it can reach
-  Postgres through its connection pool). `api` won't start until `db` reports healthy.
-- **Migrations, connection pooling, and RAG bootstrap** all happen automatically on `api` startup,
-  the same way they do outside Docker (see above) -- there is nothing extra to run. Ingest is
-  content-hash-gated, so restarting the stack, or rebuilding the image, re-checks every document and
-  does no embedding work and creates no duplicate document versions when nothing changed.
-- **Persistence**: Postgres data lives in the `parcelpilot_pg` named volume and the downloaded
-  embedding model lives in `parcelpilot_model_cache`. `docker compose down` (without `-v`) followed by
-  `docker compose up` comes back with the same data and does not re-download the model.
-- **Config**: all values in `.env.example` are read from the environment already (see `app/llm.py`,
-  `app/rag/store.py`, `app/rag/embeddings.py`) -- `docker-compose.yml` only wires them through.
-  `MEDHA_BASE_URL`/`MEDHA_API_KEY`/`MEDHA_MODEL` point at Medha/vLLM, which stays external and is
-  never bundled into the application image.
+| Detail | Behaviour |
+|---|---|
+| **Health checks** | `db` uses `pg_isready`; `api` polls `GET /api/health`; `frontend` polls its own `/api/health`. Each service waits on the previous one via `service_healthy`. |
+| **Startup work** | Migrations, connection pooling, and RAG ingest all run automatically when `api` starts — nothing extra to run. Ingest is content-hash gated, so restarts and rebuilds re-check every document and do no embedding work when nothing changed. |
+| **Persistence** | Postgres data lives in the `parcelpilot_pg` volume; the downloaded embedding model lives in `parcelpilot_model_cache`. `docker compose down` (without `-v`) then `up` comes back with the same data and no re-download. |
+| **Config** | Everything in `.env.example` is read from the environment already — `docker-compose.yml` only wires it through. `NEXT_PUBLIC_API_BASE_URL` is baked into the frontend at *build* time, so changing it needs `docker compose up --build`, not just a restart. |
 
 Makefile shortcuts:
 
@@ -59,146 +182,141 @@ make test    # deterministic tests, host .venv, against the compose db (localhos
 make eval    # live 28-case evaluation benchmark, host .venv
 ```
 
-`make test` and `make eval` run on the host (not inside the container) against the same Postgres the
-compose stack publishes on `localhost:5434`, so they need `python -m venv .venv && pip install -r
+`make test` and `make eval` run on the host against the same Postgres the compose stack
+publishes on `localhost:5434`, so they need `python -m venv .venv && pip install -r
 requirements.txt` done once, same as the dev flow above.
 
 ## What it demonstrates
 
-- Natural-language chat with visible tool trace.
-- Three distinct tools: `document_search` (hybrid retrieval, below), scoped structured order/ticket lookup and credit calculation, and a mocked `create_escalation` action.
-- Explicit confirmation: escalation requests only create a pending action. The UI must click **Confirm escalation**, calling a separate confirmation endpoint.
-- Multi-step reasoning driven by an LLM planner: the model chooses tools, extracts arguments, and writes the reply. A cancellation question typically runs order lookup, resolves account ownership, retrieves that account's agreement plus the current SOP, then applies whichever governs.
-- The planner/tool/observation cycle is orchestrated as a LangGraph state machine (`app/graph.py`):
+- **Natural-language chat** with a visible tool trace.
+- **Three distinct tool types**: hybrid document search, scoped structured lookups (orders,
+  tickets, accounts, credit/SLA calculation), and a mocked `create_escalation` action.
+- **Explicit confirmation for anything state-changing**: an escalation is only staged, never
+  created, until the user clicks **Confirm escalation** in the UI, which calls a separate
+  confirmation endpoint.
+- **Multi-step reasoning**: the LLM chooses tools and extracts arguments itself. A
+  cancellation question typically triggers order lookup → account ownership → that account's
+  agreement and the current SOP → whichever one governs.
+- **Data privacy enforced in code, not in the prompt**: every lookup checks the caller's
+  `account_id`; cross-account access returns HTTP 403 regardless of what the LLM asked for.
+- **Proactive triage**: open tickets are classified against current severity definitions and
+  the known-issue list, so tickets worded differently from the sample data are still
+  triaged correctly.
+- **Deterministic rule tools**: service-credit and SLA answers come from code, not from the
+  model re-reading a PDF table, so they hold for any plan/severity/account combination.
 
-  ```
-  planner -> execute_tool -> (observation) -> planner -> ... -> finalize
-                  |
-                  +-> confirmation_gate -> planner (final answer only)
-  ```
+## Retrieval design
 
-  LangGraph owns only the control flow. Planning, tools, prompts and permission checks are unchanged, and the graph adds one enforceable property: staging an action routes into `confirmation_gate`, which drops the planner to a final-answer-only schema, so after staging the model *cannot* call another tool rather than merely being told not to.
-- Hybrid retrieval over the source pack (`app/rag/`), persisted in ParadeDB — pg_search BM25 and
-  exact pgvector cosine search over the same rows, under the same `WHERE` clause:
+Hybrid retrieval over the source pack, persisted in ParadeDB — BM25 (`pg_search`) and exact
+cosine search (`pgvector`) run over the **same rows**, under the **same `WHERE` clause**, so
+the two ranking signals can never see a different candidate set.
 
-  ```
-  tenant + lifecycle filter
-    |
-    A. eligibility ---- one SQL predicate built from the session principal
-    |                   lifecycle -> effective window -> account entitlement
-    +--> B. BM25 (pg_search, shared tokenizer)  \
-    |                                             >-- C. reciprocal rank fusion (ranks, k=60)
-    +--> B'. exact pgvector cosine search        /
-                                                     |
-                                                     D. authority/conflict resolution
-                                                     |
-                                                     E. authoritative/context split
-                                                     |
-                                                     F. compact evidence -> Medha
-  ```
+```
+                         query
+                           │
+                           ▼
+              ┌─────────────────────────┐
+              │   ELIGIBILITY FILTER     │   one SQL predicate: account + lifecycle
+              └────────────┬─────────────┘
+                           │
+              ┌────────────┴────────────┐
+              ▼                         ▼
+      ┌───────────────┐        ┌───────────────────┐
+      │  BM25 search   │        │  Vector search     │
+      │  (pg_search)   │        │  (pgvector, exact)  │
+      └───────┬────────┘        └─────────┬──────────┘
+              └────────────┬───────────────┘
+                           ▼
+              ┌─────────────────────────┐
+              │  RECIPROCAL RANK FUSION  │   combines both rankings
+              └────────────┬─────────────┘
+                           ▼
+              ┌─────────────────────────┐
+              │   AUTHORITY RESOLUTION   │   agreement > policy/SOP > product guide > tickets
+              └────────────┬─────────────┘
+                           ▼
+              ┌─────────────────────────┐
+              │ AUTHORITATIVE / CONTEXT  │   split: can answer vs. background only
+              └────────────┬─────────────┘
+                           ▼
+                   evidence → LLM
+```
 
-  **Eligibility is applied before candidate generation, not after retrieval.** `eligibility_sql()`
-  produces one predicate and both branches are issued on top of it, so another customer's agreement
-  is never in the BM25 candidate set *or* the vector candidate set — there is nothing to filter out
-  later. A customer's scope comes from `principal.account_id` on the session, never from an argument
-  the planner supplied. Tests assert on the raw candidate sets, because "never retrieved" is a
-  weaker claim than "never a candidate".
+Six design decisions shape this pipeline — each one exists because the obvious alternative
+was tried and failed on this corpus:
 
-  **Vector search is exact, not approximate.** An HNSW index exists in the schema for future scale,
-  but the query path forces a sequential scan (`SET LOCAL enable_indexscan/enable_bitmapscan = off`)
-  so `ORDER BY distance` is the true ordering of every eligible row. Eligibility is a security
-  property here, not a ranking preference, and an approximate index does not guarantee it returns
-  the true top-k of a filtered set — at this corpus size the exact scan costs nothing.
+| Decision | Why |
+|---|---|
+| **Eligibility runs before search, not after.** The account/lifecycle filter is applied inside both the BM25 and vector queries, so another customer's documents are never in either candidate set — there is nothing to filter out later. | Tests assert on the raw candidate sets: "never retrieved" is a weaker guarantee than "never a candidate." |
+| **Vector search is exact, not approximate.** The query forces a sequential scan instead of using the HNSW index, so `ORDER BY distance` is the true ranking of every eligible row. | Eligibility here is a security property, not a ranking preference — an approximate index doesn't guarantee the true top-k of a *filtered* set. At this corpus size, an exact scan costs nothing. |
+| **One tokenizer for ingest and query.** The same `tokenize()` function builds the indexed text and the query terms. | Two independent tokenizer implementations can silently drift apart even if they agree today. |
+| **Authority is resolved after fusion, as a separate step.** Fusion ranks by relevance only; authority then re-sorts into hard tiers (signed agreement → current policy/SOP → product guide → historical tickets), and a ticket can never enter the "may answer the question" tier no matter how close its embedding is. | A close-but-wrong match (a historical ticket) must never outrank a governing policy just because it scored well. An agreement only outranks policy for the account that signed it — everyone else gets ordinary policy-tier evidence. |
+| **Documents are versioned, never overwritten.** A changed document becomes `<id>@v<n+1>`; the old version is marked superseded (chunks kept, so old citations still resolve) and excluded from all normal search. Re-ingesting identical content is a no-op via content hash. | Citations must stay resolvable even after a policy update, and re-running ingest must be safe to do repeatedly. |
+| **New documents start in `draft`, never `active`.** Only the original source pack is trusted at startup; anything ingested afterward needs a human to call `activate_version(..., verified_by=...)`. A document can demote itself but never promote itself. | Stops an uploaded "agreement" from granting itself authority it was never given — a PDF's own `Status: ACTIVE` text is not trusted. |
 
-  **BM25 and the query use one tokenizer.** `tokenize()` builds both `rag_chunks.lexical_text` at
-  ingest time and the query's search terms at request time, so the two cannot silently drift apart —
-  a risk with two independent implementations that happen to agree today.
+Two more things worth knowing:
 
-  **Authority is a separate step from relevance, run after fusion.** Fusion (RRF) ranks candidates by
-  relevance only. `resolve_authority()` then reorders the *already-relevant* candidates into tiers —
-  the account's own signed agreement, then current policy/SOP, then the product guide — and splits
-  the result into two lists: `authoritative` (may answer the question) and `context` (historical
-  ticket material only). A historical ticket can never land in `authoritative`, however close its
-  embedding; it is a hard tier, not a score penalty large enough to usually win. This also means an
-  agreement only tops the ranking for the account that signed it — for anyone else it is ordinary
-  policy-tier evidence, so an unscoped internal question is answered by the source that governs
-  everyone, not by whichever customer's contract the encoder liked best.
-
-  **Documents are versioned, never overwritten.** A changed document mints `<id>@v<n+1>`; the
-  previous version is marked `superseded` and its chunks are kept (an old citation stays
-  resolvable) but excluded from every normal search by the eligibility predicate. Re-ingesting
-  identical content is a no-op: each document's content hash — which covers the derived chunks, not
-  just the source bytes, so a chunker change is detected too — is compared first.
-
-  **New documents start in `draft`, never `active`.** A PDF's own `Status: ACTIVE` text is not
-  trusted: only the shipped source pack is admitted directly as `active` (`trusted_seed=True` at
-  startup); anything ingested afterward requires a human to call `activate_version(...,
-  verified_by=...)` before it can influence a single answer. A document can *demote* itself
-  (`Status: DEPRECATED` is honoured) but cannot promote itself — that asymmetry is what stops an
-  uploaded "agreement" from granting itself authority it was never given.
-
-  **Two texts per chunk.** `text` is the exact source clause and the only thing ever quoted;
-  `embed_text` prepends the document title, filename and section heading and is what the encoder
-  embeds. Context helps *find* a clause and can never *become* the citation.
-
-  **No score-derived topical-relevance gate.** Two were measured on this corpus and rejected: an
-  absolute dense-distance cutoff (a genuine paraphrase and the best hit for a wholly unrelated
-  question land 0.004 apart in cosine distance) and a corpus-relative z-score (a nonsense query
-  scored a *stronger* statistical outlier than the real paraphrase). A 31-chunk corpus against a
-  general-purpose encoder does not carry enough signal for either. Retrieval abstains
-  (`needs_review`) only on the two facts it can actually verify — nothing eligible matched at all,
-  or everything that matched was context-only — and leaves judging whether an excerpt answers the
-  question to Medha, per the system prompt.
-- Data privacy at the tool boundary: every structured lookup and document lookup checks customer `account_id`; cross-account access produces HTTP 403. This is not a prompt-only restriction.
-- Internal proactive queue: each open ticket is classified against the current severity definitions and known-issue list, so tickets worded differently from the sample data are still triaged on their substance.
-- Deterministic rule tools: service-credit and SLA answers come from code, not from the model re-reading a garbled PDF table, so they hold for any plan/severity or account/order combination.
+- **Two texts per chunk.** `text` is the exact source clause and the only thing ever quoted.
+  `embed_text` adds the document title and section heading and is what gets embedded — it
+  helps *find* a clause but can never *become* the citation.
+- **No score-based relevance cutoff.** Both an absolute distance cutoff and a corpus-relative
+  z-score were tested and rejected — on this small, single-domain corpus, a genuine paraphrase
+  and an unrelated question can land within 0.004 cosine distance of each other. Retrieval
+  only abstains (`needs_review`) on the two facts it can verify directly — nothing eligible
+  matched, or everything that matched was context-only — and leaves judging *relevance* of a
+  match to the LLM.
 
 ## Trust model
 
 | Source | Usage |
 |---|---|
-| Signed customer agreement | Highest authority for that account; it can override a default policy/SOP. |
-| Current Support Policy v3 and current SOP | Default rule source. |
+| Signed customer agreement | Highest authority for that account; can override the default policy/SOP. |
+| Current Support Policy v3 + current SOP | Default rule source. |
 | Current product operations guide | Product capabilities and known issues. |
-| Deprecated Support Policy v2 | Stored with `lifecycle_state='superseded'`; the retrieval predicate admits `active` only, so it is never a candidate. |
-| Historical ticket resolutions | Indexed as context at authority 10 and account-scoped, in a hard band below every governing source. Never used to determine policy or actions. |
+| Deprecated Support Policy v2 | Marked `superseded`; the retrieval predicate admits only `active` documents, so it is never a candidate. |
+| Historical ticket resolutions | Context only, account-scoped, in a hard tier below every governing source — never used to determine policy or actions. |
 
-The dataset snapshot is fixed at `2026-08-16 11:00 Asia/Kolkata`, so credit lateness calculations do not depend on the machine clock.
+The dataset snapshot is fixed at `2026-08-16 11:00 Asia/Kolkata`, so credit-lateness
+calculations don't depend on the machine clock.
 
-## Deliberate limits / escalation behaviour
+## Deliberate limits
 
-- The app does not execute a cancellation or issue a credit; only a mock escalation action exists, and it requires confirmation.
-- It refuses to promise a credit when carrier/customer fault or pickup timing is unknown.
-- Customer-facing operations are account scoped. Internal staff can access all assessment accounts; production should map SSO claims to a team/region/account entitlement table.
-- The planner is an LLM (`Medha`, an OpenAI-compatible vLLM endpoint) and the app needs it to answer; if it is unreachable the API returns 503 rather than degrading to guesswork. Configure with `MEDHA_BASE_URL`, `MEDHA_API_KEY`, `MEDHA_MODEL`.
-- That endpoint runs without `--enable-auto-tool-choice`, so native `tools` calls are rejected. Tool calls are driven through `response_format: json_schema` instead, which vLLM enforces during decoding: the model cannot emit a tool outside the set its role is allowed.
-- Permission checks, source authority and the confirmation gate live in `Toolbox`/`app/rag`, not in
-  the prompt, so prompt injection cannot widen access. The retrieval predicate is built from the
-  session principal, so a planner that asks for another account's documents changes nothing about
-  what SQL matches.
-- Retrieval needs ParadeDB; if it is unreachable the API returns 503 rather than answering a policy
-  question from the model's own memory of other companies' terms.
-- Section chunking is tuned to these single-page, numbered-clause PDFs. A multi-page contract would
-  want a token-window chunker with overlap, and the `draft`/`verified` lifecycle states exist in the
-  schema but nothing in the supplied pack occupies them — everything here arrives already approved.
-- `Alibaba-NLP/gte-base-en-v1.5` ships custom modelling code, so it loads with
-  `trust_remote_code=True`, pinned to a specific commit (`PARCELPILOT_EMBEDDING_REVISION`) rather
-  than a moving branch, and cached under `~/.cache/parcelpilot/models` rather than the ambient HF
-  cache. Swapping to a model that does not need remote code (`gte-modernbert-base` is also 768-dim)
-  is a `PARCELPILOT_EMBEDDING_MODEL` change; the ingest pipeline detects the model/revision change
-  via `embedding_model` and re-embeds automatically rather than silently mixing vector spaces.
-- Chunking is heading-aware (numbered clauses, `KI-` ids, `Section`/`Article` headers, or a generic
-  short-title-line fallback) with a 400-token/50-token-overlap window for anything a heading-based
-  section doesn't bound tightly enough. It has not been tuned against a multi-page contract with
-  deeply nested numbering.
+**Scope**
+- No cancellation or credit is ever actually executed — only a mocked, confirmation-gated
+  escalation action exists.
+- A credit is never promised when carrier/customer fault or pickup timing is unknown.
+- Customer-facing operations are account-scoped; internal staff can see all assessment
+  accounts. Production would map SSO claims to a team/region/account entitlement table
+  instead.
 
-## If I continued the product
+**Reliability**
+- The LLM planner is required, not optional — if it's unreachable, the API returns 503 rather
+  than degrading to a guess. (Config: `MEDHA_BASE_URL` / `MEDHA_API_KEY` / `MEDHA_MODEL` — the
+  env var names predate this doc and point at any OpenAI-compatible endpoint, not a specific
+  model.)
+- The LLM endpoint runs without native tool-calling; tool selection is instead enforced via
+  constrained JSON-schema decoding, so the model literally cannot emit a tool outside the set
+  its role is allowed to call.
+- Retrieval needs ParadeDB — if it's unreachable, the API returns 503 rather than answering a
+  policy question from the model's own training-data memory of other companies' terms.
 
-1. **Authenticated identity and audit ledger** — SSO/OIDC claims, row-level database security, immutable tool/action audit events, and action idempotency. This is the trust foundation.
-2. **Document lifecycle controls** — the ingest pipeline, effective dates, agreement-to-account binding, versioning/supersession and human-gated activation (`draft -> verified -> active`, `app/rag/ingest.py`) now exist; what remains is a UI for the review step (today `activate_version()` is called directly) and semantic/version diff between two versions of a document.
-3. **Quality system** — a scenario test set, retrieval citations checked by humans, policy-conflict tests, calibration/abstention metrics, and sampled support-QA review.
-4. **Operational intelligence** — time-series anomaly detection, carrier/account clusters, SLA-clock computation with business calendars, and routing to an incident channel.
-5. **Safe actions** — cancellation/credit workflows connected to real systems with policy checks repeated at execution time, manager approval thresholds, and customer notification drafts rather than automatic sends.
+**Security**
+- Permission checks, source authority, and the confirmation gate all live in code
+  (`Toolbox`/`app/rag`), never in the prompt — prompt injection can't widen access, because
+  the retrieval predicate is built from the session's principal, not from anything the LLM
+  supplies.
+
+**Source pack**
+- Section chunking is tuned to these single-page, numbered-clause PDFs; a multi-page contract
+  would want a token-window chunker with overlap. The `draft`/`verified` lifecycle states
+  exist in the schema but are unused here — everything in the pack arrives pre-approved.
+- The embedding model (`Alibaba-NLP/gte-base-en-v1.5`) ships custom modelling code, so it's
+  pinned to a specific commit and cached outside the ambient Hugging Face cache. A model or
+  revision change is detected automatically and triggers a full re-embed rather than silently
+  mixing vector spaces.
+- Chunking is heading-aware (numbered clauses, `KI-` ids, section headers) with a token-window
+  fallback for anything a heading doesn't bound tightly. It hasn't been tuned against a
+  multi-page contract with deeply nested numbering.
 
 ## Tests
 
@@ -206,22 +324,38 @@ The dataset snapshot is fixed at `2026-08-16 11:00 Asia/Kolkata`, so credit late
 pytest -q
 ```
 
-`tests/test_agent.py` covers contract precedence, cross-account denial, a contract-specific
-service-credit rule, confirmation before a state-changing escalation, SLA and credit resolution for
-accounts with no signed agreement, and the graph's confirmation-gate topology.
+- **`tests/test_agent.py`** — contract precedence, cross-account denial, a contract-specific
+  service-credit rule, confirmation before a state-changing escalation, SLA/credit resolution
+  for accounts with no signed agreement, and the graph's confirmation-gate topology.
+- **`tests/test_rag.py`** (36 tests) — paraphrase recall, that a customer with no agreement
+  never gets another account's contract or tickets into either candidate set, that the
+  signing account gets its own agreement ranked first, that a superseded policy never
+  participates while the current one does, that a historical ticket can never land in
+  `authoritative` regardless of score, that a document version change supersedes without
+  deleting old chunks, that self-promotion to `active` is impossible, that ingest and query
+  use the provably same tokenizer, that a model/revision change forces a re-embed, and that
+  citations are stable with page/section provenance.
 
-`tests/test_rag.py` covers retrieval (36 tests): paraphrase recall through the dense branch, that a
-customer with no agreement never gets another account's contract or tickets into either candidate
-set, that the account which signed one gets it ranked first, that the superseded policy never
-participates while the current one does, that a historical ticket can never land in `authoritative`
-regardless of relevance score, that an agreement only governs the account that signed it, that
-changing a document mints a new version and supersedes the old one without deleting its chunks, that
-a document cannot self-promote to `active` and `activate_version` requires a named human, that
-ingest/query tokenization is provably the same function, that a model/revision change re-embeds
-instead of silently mixing vector spaces, an embedding smoke test, that re-ingesting identical
-content writes nothing, and that citations are stable and carry page/section provenance.
+Both suites need the database (`docker compose up -d db`) and network access to the LLM
+endpoint — there's no in-memory retrieval fallback, since a hybrid retriever tested against a
+stand-in would prove nothing about the BM25 index, the exact vector search, or the SQL
+predicate that is the actual security boundary.
 
-Both need the database (`docker compose up -d db`) and network access to the planner endpoint.
-There is no in-memory retrieval fallback to run against: a hybrid retriever verified against a
-stand-in would prove nothing about the BM25 index, the exact vector search, or the SQL predicate
-that is the security boundary.
+## Roadmap
+
+If this went further as a product, in priority order:
+
+1. **Authenticated identity and audit ledger** — SSO/OIDC claims, row-level database
+   security, immutable tool/action audit events, action idempotency. The trust foundation
+   everything else sits on.
+2. **Document lifecycle UI** — versioning, supersession, and human-gated activation
+   (`draft → verified → active`) already exist in the pipeline; what's missing is a review UI
+   (today `activate_version()` is called directly) and a semantic diff between document
+   versions.
+3. **Quality system** — a scenario test set, human-checked retrieval citations,
+   policy-conflict tests, calibration/abstention metrics, sampled support-QA review.
+4. **Operational intelligence** — time-series anomaly detection, carrier/account clustering,
+   SLA-clock computation with business calendars, routing into an incident channel.
+5. **Safe actions** — cancellation/credit workflows wired to real systems, with policy checks
+   re-run at execution time, manager approval thresholds, and drafted (not auto-sent) customer
+   notifications.

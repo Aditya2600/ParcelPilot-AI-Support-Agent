@@ -12,7 +12,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY data ./data
-COPY static ./static
 COPY main.py ./main.py
 
 # Non-root runtime user. The embedding model cache and any writable app state

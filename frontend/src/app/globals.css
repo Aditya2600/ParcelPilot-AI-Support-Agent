@@ -1,0 +1,197 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    /* Surfaces: neutral charcoal, deliberately zero blue -- every channel is
+       within 1 point of the others. The flanking rails are DARKER than the
+       conversation, so the centre column reads as the subject of the app. */
+    --app-bg: #0a0a0a;
+    --sidebar: #0a0a0b;
+    --main: #101011;
+    --inspector: #0a0a0b;
+    --popover: #18181a;
+
+    /* Raised rows/cards. Kept close to the surface they sit on: hierarchy comes
+       from the 1px border, not from elevation or shadow. */
+    --surface: #171718;
+    --surface-hover: #1d1d1f;
+    --surface-active: #232325;
+
+    --border: rgba(255, 255, 255, 0.07);
+    --border-hover: rgba(255, 255, 255, 0.13);
+
+    --text: #f5f5f5;
+    --text-2: #a2a2a2;
+    --text-3: #6e6e6e;
+
+    /* The "accent" is white. Selection and emphasis are expressed by lifting
+       contrast, never by introducing a hue -- the UI stays monochrome. */
+    --accent: #f5f5f5;
+    --accent-hover: #ffffff;
+    --accent-soft: rgba(255, 255, 255, 0.06);
+    --accent-border: rgba(255, 255, 255, 0.24);
+    --accent-text: #f5f5f5;
+
+    /* Status is the only hue in the product, and it appears at icon/dot scale:
+       desaturated enough to sit on charcoal without glowing. */
+    --success: #4d9e78;
+    --success-soft: rgba(77, 158, 120, 0.09);
+    --success-border: rgba(77, 158, 120, 0.22);
+    --success-text: #7cbf9d;
+
+    --warning: #b98f4d;
+    --warning-soft: rgba(185, 143, 77, 0.09);
+    --warning-border: rgba(185, 143, 77, 0.22);
+    --warning-text: #d0aa72;
+
+    --critical: #c96f6f;
+    --critical-soft: rgba(201, 111, 111, 0.09);
+    --critical-border: rgba(201, 111, 111, 0.22);
+    --critical-text: #dd9494;
+  }
+}
+
+body {
+  background-color: var(--app-bg);
+  color: var(--text);
+  font-family: var(--font-geist-sans), -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code, kbd, pre, samp {
+  font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* Thin, mostly invisible scrollbars -- panels should not read as scroll regions
+   until the pointer is actually in them. */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.13);
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Answer typography: 14px / 1.55 is the document rhythm the whole feed uses. */
+.prose-dark {
+  color: #d2d2d2;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.prose-dark p {
+  margin-top: 0.7rem;
+  margin-bottom: 0.7rem;
+}
+
+.prose-dark p:first-child {
+  margin-top: 0;
+}
+
+.prose-dark p:last-child {
+  margin-bottom: 0;
+}
+
+/* The lead sentence of an answer is the verdict -- it carries slightly more
+   weight and full-strength colour than the explanation that follows it. */
+.prose-dark > p:first-child {
+  color: var(--text);
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.015em;
+  margin-bottom: 0.6rem;
+}
+
+.prose-dark strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.prose-dark ul {
+  list-style-type: disc;
+  padding-left: 1.15rem;
+  margin-top: 0.6rem;
+  margin-bottom: 0.6rem;
+}
+
+.prose-dark ol {
+  list-style-type: decimal;
+  padding-left: 1.15rem;
+  margin-top: 0.6rem;
+  margin-bottom: 0.6rem;
+}
+
+.prose-dark li {
+  margin-top: 0.2rem;
+  margin-bottom: 0.2rem;
+}
+
+.prose-dark code {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  padding: 0.1rem 0.3rem;
+  border-radius: 4px;
+  font-size: 0.85em;
+  color: #e4e4e4;
+}
+
+.prose-dark a {
+  color: var(--accent-text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.prose-dark table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.7rem 0;
+  font-size: 13px;
+}
+
+.prose-dark th,
+.prose-dark td {
+  border: 1px solid var(--border);
+  padding: 0.35rem 0.55rem;
+  text-align: left;
+}
+
+.prose-dark th {
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+/* "ParcelPilot is working…" indicator */
+@keyframes pp-dot {
+  0%, 60%, 100% { opacity: 0.2; }
+  30% { opacity: 1; }
+}
+
+.pp-dot {
+  animation: pp-dot 1.3s ease-in-out infinite;
+}
+
+.pp-dot:nth-child(2) { animation-delay: 0.16s; }
+.pp-dot:nth-child(3) { animation-delay: 0.32s; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pp-dot { animation: none; opacity: 0.6; }
+}

@@ -51,6 +51,10 @@ services:
       PARCELPILOT_EMBEDDING_MODEL:
       PARCELPILOT_EMBEDDING_REVISION:
       PARCELPILOT_RERANKER_MODEL:
+      # Browser origin the frontend container is published on. Must match
+      # NEXT_PUBLIC_API_BASE_URL's origin's counterpart below, or the browser's
+      # CORS preflight to this API fails.
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
     volumes:
       # Embedding model weights (~550MB) persist across restarts/rebuilds instead
       # of re-downloading; content-hash ingest already makes restarts a no-op, this
@@ -64,6 +68,29 @@ services:
       interval: 15s
       timeout: 5s
       start_period: 60s
+      retries: 5
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Build-time only (Next.js inlines NEXT_PUBLIC_* into the client bundle),
+        # so changing this after the image is built requires a rebuild, not just
+        # a container restart. Defaults to the api's host-published port so the
+        # browser (not other containers) can reach it directly.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:${API_PORT:-8000}}
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/api/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
       retries: 5
     restart: unless-stopped
 
